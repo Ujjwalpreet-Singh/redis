@@ -13,7 +13,7 @@ static void *worker(void *arg){
         Work w = tp->queue.front();
         tp->queue.pop_front();
         pthread_mutex_unlock(&tp->mu);
-        w.f(arg);
+        w.f(w.arg);
     }
 
     return NULL;

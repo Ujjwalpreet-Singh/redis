@@ -62,7 +62,7 @@ enum {
 enum {
     T_INIT = 1,
     T_STR = 2,
-    T_ZSET = 2,
+    T_ZSET = 3,
 };
 
 struct Response {

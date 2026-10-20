@@ -1,2 +1,2 @@
-g++ -Wall -Wextra -Og -g server.cpp hashtable.cpp zset.cpp avl.cpp -o server
+g++ -Wall -Wextra -Og -g server.cpp hashtable.cpp zset.cpp avl.cpp heap.cpp threadpool.cpp -o server
 g++ -Wall -Wextra -Og -g client.cpp -o client
