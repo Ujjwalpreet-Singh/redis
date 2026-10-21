@@ -1,26 +1,30 @@
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+
+#ifndef WINVER
+#define WINVER 0x0600
+#endif
 #include <stdint.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/ip.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <vector>
-#include <poll.h>
-#include <fcntl.h>
 #include <string>
 #include <map>
-#include "hashtable.h"
-#include "common.h"
-#include "zset.h"
+#include "..\hashtable.h"
+#include "..\common.h"
+#include "..\zset.h"
 #include <math.h>
-#include "list.h"
-#include <time.h>
-#include "heap.h"
+#include "..\list.h"
+#include <chrono>
+#include "..\heap.h"
 #include "threadpool.h"
+#include <unordered_map>
 
 
 
@@ -28,7 +32,7 @@ const size_t k_max_msg = 32 << 20;
 typedef std::vector<uint8_t> Buffer;
 
 struct Conn {
-    int fd = -1;
+    SOCKET fd = INVALID_SOCKET;
     // application's intention, for the event loop
     bool want_read = false;
     bool want_write = false;
@@ -72,7 +76,7 @@ struct Response {
 
 static struct {
     HMap db;
-    std::vector<Conn *> fd2conn;
+    std::unordered_map<SOCKET,Conn*> fd2conn;
     DList idle_list;
     std::vector<HeapItem> heap;
     ThreadPool thread_pool;
@@ -94,40 +98,39 @@ struct LookupKey {
 };
 
 static void die(const char *msg) {
-    int err = errno;
+    int err = WSAGetLastError();
     fprintf(stderr, "[%d] %s\n", err, msg);
     abort();
 };
 
-static void fd_set_nb(int fd) {
-    errno = 0;
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (errno) {
-        die("fcntl error");
-        return;
-    }
+void fd_set_nb(SOCKET fd) {
+    u_long mode = 1;
 
-    flags |= O_NONBLOCK;
-
-    errno = 0;
-    (void)fcntl(fd, F_SETFL, flags);
-    if (errno) {
-        die("fcntl error");
+    if (ioctlsocket(fd, FIONBIO, &mode) == SOCKET_ERROR) {
+        die("socket die");
     }
 }
 
 
 static uint64_t get_monotonic_msec() {
-    struct timespec tv = {0, 0};
-    clock_gettime(CLOCK_MONOTONIC, &tv);
-    return uint64_t(tv.tv_sec) * 1000 + tv.tv_nsec / 1000 / 1000;
-};
+    using namespace std::chrono;
 
-static Conn *handle_accept(int fd){
-    struct sockaddr_in client_addr = {};
-    socklen_t addrlen = sizeof(client_addr);
-    int connfd = accept(fd,(struct sockaddr *)&client_addr,&addrlen);
-    if (connfd < 0){
+    return static_cast<uint64_t>(
+        duration_cast<milliseconds>(
+            steady_clock::now().time_since_epoch()
+        ).count()
+    );
+}
+
+static Conn *handle_accept(SOCKET fd){
+    sockaddr_in client_addr = {};
+    int addrlen = sizeof(client_addr);
+	SOCKET connfd = accept(
+		fd,
+		reinterpret_cast<sockaddr*>(&client_addr),
+		&addrlen
+    );
+    if (connfd == INVALID_SOCKET){
         return NULL;
     }
     uint32_t ip = client_addr.sin_addr.s_addr;
@@ -143,8 +146,8 @@ static Conn *handle_accept(int fd){
 };
 
 static void conn_destroy(Conn *conn){
-    (void)close(conn->fd);
-    g_data.fd2conn[conn->fd] = NULL;
+    (void)closesocket(conn->fd);
+    g_data.fd2conn.erase(conn->fd);
     dlist_detach(&conn->idle_node);
     delete conn;
 };
@@ -631,17 +634,20 @@ static bool try_one_request(Conn *conn) {
 
 static void handle_write(Conn *conn) {
     assert(conn->outgoing.size() > 0);
-    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
-    if (rv < 0 && errno == EAGAIN){
-        return;
-    }
-    if (rv < 0) {
-        msg("write() error");
-        conn->want_close = true;    // error handling
-        return;
-    }
+    int rv = send(conn->fd, reinterpret_cast<const char *>(conn->outgoing.data()), static_cast<int>(conn->outgoing.size()),0);
+    if (rv == SOCKET_ERROR) {
+		int err = WSAGetLastError();
+
+		if (err == WSAEWOULDBLOCK) {
+			return;
+		}
+
+		msg("send() error");
+		conn->want_close = true;
+		return;
+	}
     // remove written data from `outgoing`
-    buf_consume(conn->outgoing, (size_t)rv);
+    buf_consume(conn->outgoing, static_cast<size_t>(rv));
     // ...
         if (conn->outgoing.size() == 0){
         conn->want_read = true;
@@ -651,24 +657,30 @@ static void handle_write(Conn *conn) {
 
 
 static void handle_read(Conn *conn) {
-    fprintf(stderr, "handle_read fd=%d\n", conn->fd);
+    fprintf(stderr, "handle_read fd=%llu\n",static_cast<unsigned long long>(conn->fd));
 
     uint8_t buf[64 * 1024];
 
-    ssize_t rv = read(conn->fd, buf, sizeof(buf));
+    int rv = recv(
+		conn->fd,
+		reinterpret_cast<char*>(buf),
+		static_cast<int>(sizeof(buf)),
+		0
+	);
 
-    fprintf(stderr, "read returned %ld\n", rv);
+    fprintf(stderr, "read returned %d\n", rv);
 
-    if (rv < 0 && errno == EAGAIN) {
-        fprintf(stderr, "EAGAIN\n");
-        return;
-    }
+    if (rv == SOCKET_ERROR) {
+		int err = WSAGetLastError();
 
-    if (rv < 0) {
-        msg("read() error");
-        conn->want_close = true;
-        return;
-    }
+		if (err == WSAEWOULDBLOCK) {
+			return;
+		}
+
+		msg("recv() error");
+		conn->want_close = true;
+		return;
+	}
 
     if (rv == 0) {
         msg("client closed");
@@ -676,7 +688,7 @@ static void handle_read(Conn *conn) {
         return;
     }
 
-    fprintf(stderr, "received %ld bytes\n", rv);
+    fprintf(stderr, "received %d bytes\n", rv);
 
     buf_append(conn->incoming, buf, (size_t)rv);
 
@@ -697,7 +709,7 @@ static void handle_read(Conn *conn) {
 
 const uint64_t k_idle_timeout_ms = 5 * 1000;
 
-static uint32_t next_timer_ms() {
+static int32_t next_timer_ms() {
     uint64_t now_ms = get_monotonic_msec();
     uint64_t next_ms = (uint64_t)-1;    // maximum value
     // idle timers using a linked list
@@ -732,7 +744,7 @@ static void process_timers(){
         if (next_ms > now){
             break;
         }
-        fprintf(stderr,"removing idle connection: %d\n",conn->fd);
+        fprintf(stderr,"removing idle connection: %llu\n",static_cast<unsigned long long>(conn->fd));
         conn_destroy(conn);
     }
 
@@ -750,9 +762,33 @@ int main(){
     dlist_init(&g_data.idle_list);
     thread_pool_init(&g_data.thread_pool, 4);
     printf("inside");
-    int fd = socket(AF_INET,SOCK_STREAM,0);
+    WSADATA wsaData;
+
+	int wsa_result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+	if (wsa_result != 0) {
+		fprintf(stderr, "WSAStartup failed: %d\n", wsa_result);
+		return 1;
+	}
+
+	SOCKET fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+	if (fd == INVALID_SOCKET) {
+		fprintf(stderr, "socket failed: %d\n", WSAGetLastError());
+		WSACleanup();
+		return 1;
+	}
+	
     int val = 1;
-    setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&val,sizeof(val));
+    if (setsockopt(
+			fd,
+			SOL_SOCKET,
+			SO_REUSEADDR,
+			reinterpret_cast<const char *>(&val),
+			sizeof(val)
+		) == SOCKET_ERROR) {
+		die("setsockopt()");
+	}
 
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
@@ -769,19 +805,21 @@ int main(){
     if (rv) { die("listen()"); }
 
     // the event loop
-    std::vector<struct pollfd> poll_args;
+    std::vector<WSAPOLLFD> poll_args;
     while (true) {
         // prepare the arguments of the poll()
         poll_args.clear();
         // put the listening sockets in the first position
-        struct pollfd pfd = {fd, POLLIN, 0};
+        WSAPOLLFD pfd = {fd, POLLIN, 0};
         poll_args.push_back(pfd);
         // the rest are connection sockets
-        for (Conn *conn : g_data.fd2conn) {
+        for (const auto& item : g_data.fd2conn) {
+			SOCKET fd = item.first;
+			Conn* conn = item.second;
             if (!conn) {
                 continue;
             }
-            struct pollfd pfd = {conn->fd, POLLERR, 0};
+            WSAPOLLFD pfd = {fd, 0, 0};
             // poll() flags from the application's intent
             if (conn->want_read) {
                 pfd.events |= POLLIN;
@@ -795,36 +833,39 @@ int main(){
         // more ...
 
         int32_t timeout_ms = next_timer_ms();
-        int rv = poll(poll_args.data(),(nfds_t)poll_args.size(),timeout_ms);
+        int rv = WSAPoll(poll_args.data(),static_cast<ULONG>(poll_args.size()),timeout_ms);
         
 
-        if (rv < 0 && errno == EINTR){
-            continue;
-        };
+        if (rv == SOCKET_ERROR) {
+			int err = WSAGetLastError();
 
-        if (rv < 0){
-            die("poll");
-        }
+			if (err == WSAEINTR) {
+				continue;
+			}
+
+			die("WSAPoll()");
+		}
 
 
-        if (poll_args[0].revents) {
-            if (Conn *conn = handle_accept(fd)) {
-                if (g_data.fd2conn.size() <= (size_t)conn->fd){
-                    g_data.fd2conn.resize(conn->fd + 1);
-
-                    
-                }
-                assert(!g_data.fd2conn[conn->fd]);
-                g_data.fd2conn[conn->fd] = conn;
-            }
-        }
+        if (poll_args[0].revents & POLLIN) {
+			if (Conn *conn = handle_accept(fd)) {
+				auto result = g_data.fd2conn.emplace(conn->fd, conn);
+				assert(result.second);
+			}
+		}
 
         for (size_t i = 1; i < poll_args.size(); ++i) { // note: skip the 1st
             uint32_t ready = poll_args[i].revents;
             if (ready == 0){
                 continue;
             }
-            Conn *conn = g_data.fd2conn[poll_args[i].fd];
+            auto it = g_data.fd2conn.find(poll_args[i].fd);
+
+			if (it == g_data.fd2conn.end()) {
+				continue;
+			}
+
+			Conn *conn = it->second;
             conn->last_active_ms = get_monotonic_msec();
             dlist_detach(&conn->idle_node);
             dlist_insert_before(&g_data.idle_list,&conn->idle_node);
@@ -836,9 +877,10 @@ int main(){
                 assert(conn->want_write);
                 handle_write(conn); // application logic
             }
-            if ((ready & POLLERR) || conn->want_close) {
-                conn_destroy(conn);
-            }
+			if ((ready & (POLLERR | POLLHUP | POLLNVAL)) ||
+				conn->want_close) {
+				conn_destroy(conn);
+			}
         }
         process_timers();
     }

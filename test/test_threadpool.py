@@ -1,7 +1,7 @@
 import subprocess
 import time
 
-CLIENT = "./client"
+CLIENT = "..//client.exe"
 
 def run(command):
     result = subprocess.run(
